@@ -30,6 +30,8 @@ type Config struct {
 	SudoIDs          []string
 	MaxIterations    int
 
+	WAOwnerID string
+
 	WebPort       string
 	WebLoginCode  string
 	WebJWTSecret  string
@@ -46,6 +48,7 @@ var Cfg = Config{
 	OwnerID:          "",
 	SudoIDs:          []string{},
 	MaxIterations:    10,
+	WAOwnerID:        "",
 	WebPort:          ":8080",
 	WebLoginCode:     "123456",
 	WebJWTSecret:     "",
@@ -75,6 +78,7 @@ func init() {
 	Cfg.TelegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	Cfg.OwnerID = os.Getenv("OWNER_ID")
 	Cfg.SudoIDs = strings.Fields(os.Getenv("SUDO_IDS"))
+	Cfg.WAOwnerID = os.Getenv("WA_OWNER_ID")
 
 	if maxIter := os.Getenv("MAX_ITERATIONS"); maxIter != "" {
 		if n, err := strconv.Atoi(maxIter); err == nil && n > 0 {

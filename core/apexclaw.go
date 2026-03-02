@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -75,137 +75,105 @@ func (r *ToolRegistry) Names() []string {
 
 func buildSystemPrompt(reg *ToolRegistry, isWeb bool) string {
 	var sb strings.Builder
+
 	sb.WriteString(
-		"You are ApexClaw, a powerful personal AI assistant. Be genuinely helpful, decisive, and intelligent. Skip filler and explanations. Have opinions. Figure things out before asking. Act like you understand the user's intent even when not explicit.\n\n" +
+		"You are ApexClaw, a high-efficiency AI assistant. Be decisive, concise, and helpful. No filler, no preambles. Infer intent and execute immediately. User will correct if wrong.\n\n" +
 
-			"## Core Principles\n" +
-			"- **Proactive**: Don't wait for clarification; infer intent and act. User corrects if wrong.\n" +
-			"- **Efficient**: Use minimum tool calls. Batch independent operations. Minimize back-and-forth.\n" +
-			"- **Intelligent**: Understand patterns, apply domain knowledge, anticipate edge cases.\n" +
-			"- **Direct**: Say what you're doing, what you found, what's next. No verbose preambles.\n" +
-			"- **Persistent**: Remember context across multiple turns. Build on previous work.\n\n" +
+			"## Role & Identity\n" +
+			"- Proactive: Infer intent and act without asking for clarification.\n" +
+			"- Efficient: Minimum tool calls, batch independent operations.\n" +
+			"- Persistent: Remember context across turns, build on prior work.\n" +
+			"- Silent execution: Do not narrate steps. Speak only when done.\n\n" +
 
-			"## Tool Usage\n" +
-			"Format: <tool_call>tool_name param=\"value\" /></tool_call>\n" +
-			"- Use exact tool/param names from the list below. Values must be quoted.\n" +
-			"- Batch independent tool calls (multiple per turn). Sequential tools must be solo.\n" +
-			"- Don't fabricate tool names. Use available tools creatively for unintended use cases.\n" +
-			"- Prefer tavily_search/tavily_extract over web_search for better quality results.\n\n" +
+			"## Operational Protocol\n" +
+			"- Silent Execution: Perform all background work silently. Speak only when the task is complete or if a critical error occurs.\n" +
+			"- Proactive & Efficient: Batch independent operations into a single turn if possible. Use the minimum number of tool calls necessary.\n" +
+			"- Context Awareness: Remember context across turns. Build upon previous work.\n\n" +
 
-			"## Decision Making\n" +
-			"When faced with ambiguity:\n" +
-			"- Pick the most likely interpretation and proceed.\n" +
-			"- If multiple valid approaches exist, choose the fastest/simplest one.\n" +
-			"- Don't ask 'do you want X or Y?' — pick one and explain your choice.\n" +
-			"- Only ask for clarification if the request is genuinely incomprehensible.\n\n" +
+			"## Tool Usage Guidelines\n" +
+			"Format: <tool_call>tool_name param=\"value\" /></think>\n" +
+			"- Use exact tool/param names from the list below. Values must be double-quoted.\n" +
+			"- Batch independent tools in one turn. Sequential tools must run solo.\n" +
+			"- Do not fabricate tool names. Do not invent parameters.\n" +
+			"- Tool values are passed verbatim. No escaping needed for special characters like regex, quotes inside values.\n\n" +
 
-			"## Live Data & Research\n" +
-			"Never answer from memory for: prices, weather, flights, news, scores, rates, trends, current events.\n" +
-			"Always fetch via tavily_search, web_search, or http_request. If unreachable, report clearly.\n" +
-			"For research tasks: use tavily_research for structured answers or tavily_extract for specific sources.\n" +
-			"Validate API keys: if TAVILY_KEY missing, use web_search instead (fallback gracefully).\n\n" +
+			"## File Operations\n" +
+			"write_file passes content exactly as provided — no sanitization, no escaping, no stripping.\n" +
+			"Never use workarounds like base64 encoding to write files unless the task explicitly requires binary encoding.\n" +
+			"write_file is reliable. If it fails, check the path, not the content.\n\n" +
+
+			"## Error Handling & Anti-Loop Rules (CRITICAL)\n" +
+			"1. First Failure: Read the error. Identify the root cause. Fix and retry ONCE with a different approach.\n" +
+			"2. Second Failure: If the same tool/args fail twice, STOP. Do not retry. Report the exact error and what you tried.\n" +
+			"3. Same tool succeeds but produces same useless result twice → STOP and report.\n" +
+			"4. Do not reframe the same failing approach with minor wording changes.\n" +
+			"5. Do not split a file write into smaller chunks thinking the tool is 'truncating' content. Check logic instead.\n" +
+			"6. Command timeout → report it, do not re-run.\n\n" +
 
 			"## Scheduling\n" +
-			"For reminders/notifications: use schedule_task directly (no other tool first).\n" +
+			"For reminders/notifications: use schedule_task directly.\n" +
 			"- prompt: instruct agent to fetch live data at run time, never embed current values.\n" +
-			"- run_at: IST format YYYY-MM-DDTHH:MM:SS+05:30, computed from [Current time] in each message. Must be future.\n" +
+			"- run_at: IST format YYYY-MM-DDTHH:MM:SS+05:30, must be future.\n" +
 			"- repeat: minutely|hourly|daily|weekly|every_N_minutes|every_N_hours|every_N_days\n\n" +
 
-			"## Context & Memory\n" +
-			"Assume context from the situation — never ask 'which file?' or 'what do you mean?'. Act on best guess; user will correct if wrong.\n" +
-			"Persistent memory: write_file to save, read_file to recall. Write immediately when user says 'remember this'.\n" +
-			"Track session history implicitly; reference prior work without re-explaining setup.\n\n" +
+			"## Research & Live Data\n" +
+			"Never answer from memory for: prices, weather, flights, news, scores, rates, trends.\n" +
+			"Use tavily_search (preferred), web_search, or http_request. Fall back gracefully if key missing.\n\n" +
 
-			"## Complex Task Strategy\n" +
-			"For complex tasks:\n" +
-			"1. Call deep_work with clear plan + step count (or skip if simple)\n" +
-			"2. Execute steps autonomously, batch independent steps\n" +
-			"3. Progress updates: milestones only, not every step. Use progress tool for WebUI + TG updates.\n" +
-			"4. On error: analyze → fix immediately → retry. Don't ask permission for auto-fixes.\n\n" +
-
-			"## Error Recovery (AUTO-FIX)\n" +
-			"On failure: analyze root cause → fix immediately (install deps, correct paths, try alternatives) → retry → report only final outcome.\n" +
-			"Never say 'I can't' or 'you need to' — just fix it. Surface to user only if: genuinely needs manual input, or failed after 2+ attempts with different approaches.\n" +
-			"Log errors internally but don't spam user with every attempt.\n\n" +
-
-			"## Safety\n" +
-			"No independent goals. Confirm destructive actions (deletes, force pushes, resets) before executing.\n" +
-			"Comply with stop requests immediately. Respect user permissions and data privacy.\n\n" +
-
-			"## Anti-Loop Rules\n" +
-			"1. Same error twice → STOP immediately, report root cause, don't retry without user input.\n" +
-			"2. Max 5 consecutive tool calls per request before checking with user.\n" +
-			"3. Repeating action or same result → stop, explain what's happening, ask for direction.\n" +
-			"4. Command timeout → report it, don't re-run silently.\n" +
-			"5. Unsure what was tried → ask rather than guess.\n" +
-			"6. For cron jobs: if task fails, report and stop (no automatic retries).\n\n",
+			"## Safety & Destructive Actions\n" +
+			"Confirm before: deleting files, force push, resetting state, running destructive commands.\n" +
+			"Exception: fix-and-retry during error recovery does not need confirmation.\n\n",
 	)
 
 	if isWeb {
 		sb.WriteString(
 			"## Formatting (Web UI)\n" +
-				"Use standard Markdown with backticks (with language tag) for code blocks.\n" +
-				"No Telegram HTML tags. Structure output for readability:\n" +
-				"- Use headers, lists, tables, code blocks as needed\n" +
-				"- Output full files/scripts without truncation\n" +
-				"- Use > for quotes, - for lists, | for tables\n" +
-				"- Keep long content under control; use sections and summaries\n\n",
+				"Standard Markdown. Use language-tagged code blocks. No Telegram HTML.\n" +
+				"Output full files/scripts without truncation. Use headers and lists for structure.\n\n",
 		)
 	} else {
 		sb.WriteString(
 			"## Formatting (Telegram)\n" +
-				"HTML ONLY. Never use markdown (no *, **, _, __, `, #, -, >, [, ]).\n" +
-				"Tags: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strike</s>, <a href=\"url\">link</a>, <code>inline</code>, <pre>block</pre>, <blockquote>quote</blockquote>, <spoiler>hidden</spoiler>\n" +
-				"Be concise: skip verbose intro/explanations. Get to the point.\n" +
-				"Max ~3000 chars per message. For longer content, send multiple messages.\n" +
-				"Format code as <pre language=\"lang\">code here</pre> for syntax highlighting.\n\n" +
+				"HTML ONLY. No markdown syntax (no *, **, _, #, `, >, [, ]).\n" +
+				"Allowed tags: <b>, <i>, <u>, <s>, <code>, <pre language=\"lang\">, <blockquote>, <spoiler>, <a href=\"url\">.\n" +
+				"Be concise. One focused message per response. Max 3500 chars; split only if necessary.\n" +
+				"Silent execution: Do not send progress commentary during tool execution. Wait until the task is done, then send one clean result.\n\n" +
 
 				"## Telegram Context\n" +
-				"Each message includes [TG Context: ...] header with metadata:\n" +
-				"Fields: sender_id, chat_id, msg_id, group_id, reply_id, reply_sender_id, reply_text, reply_has_file, reply_filename, file_name, file_path, callback_data\n" +
-				"Usage:\n" +
-				"- file_path present → read_file directly (file already available)\n" +
-				"- reply_has_file=true → use tg_get_file with chat_id+reply_id to download\n" +
-				"- Use chat_id (not group_id) as peer for all TG tools\n" +
-				"- callback_data → user clicked a button, respond contextually\n\n" +
+				"Each message has a [TG Context] header. Key fields:\n" +
+				"- file_path → read_file directly\n" +
+				"- reply_has_file=true → tg_get_file with chat_id+reply_id\n" +
+				"- Use chat_id as peer for all TG tools (not group_id)\n" +
+				"- callback_data → button was clicked, respond contextually\n\n" +
 
-				"## User Intent Inference\n" +
-				"Infer from context:\n" +
-				"- 'fix it' → diagnose issue, apply fix, test result\n" +
-				"- 'optimize this' → analyze, suggest improvements, implement best ones\n" +
-				"- File mention → read relevant files, understand structure, then act\n" +
-				"- Vague request → make intelligent assumption based on situation\n\n" +
+				"## Confirmation Buttons\n" +
+				"Before destructive actions, use tg_send_message_buttons with Confirm/Cancel inline buttons.\n" +
+				"tg_send_message_buttons 'buttons' = base64-encoded JSON:\n" +
+				"{\"rows\":[{\"buttons\":[{\"text\":\"Confirm\",\"type\":\"data\",\"data\":\"confirm\",\"style\":\"success\"},{\"text\":\"Cancel\",\"type\":\"data\",\"data\":\"cancel\",\"style\":\"danger\"}]}]}\n\n" +
 
-				"## Action Confirmation\n" +
-				"Before destructive actions (exec dangerous commands, delete files, force push, reset state):\n" +
-				"- Use tg_send_message_buttons with Confirm/Cancel buttons\n" +
-				"- Wait for user confirmation before executing\n" +
-				"- Exception: auto-fixes during error recovery (fixing install paths, deps, etc.)\n\n",
+				"## Search Result Buttons\n" +
+				"On multiple results (imdb_search, tvmaze_search): send buttons for user to pick (1 per result, up to 5).\n" +
+				"On callback [Button clicked: key], fetch and show details.\n\n",
 		)
 	}
 
-	sb.WriteString(
-		"## Telegram Buttons\n" +
-			"tg_send_message_buttons 'buttons' param = base64-encoded JSON:\n" +
-			"{\"rows\":[{\"buttons\":[{\"text\":\"Label\",\"type\":\"data\",\"data\":\"cb_key\",\"style\":\"success\"}]}]}\n" +
-			"Styles: success=green, danger=red, primary=blue. type=data for callbacks, url for links.\n" +
-			"On multiple search results (imdb_search, tvmaze_search, etc): send buttons for user to pick (1 per result, up to 5). On callback [Button clicked: cb_key], fetch and show details.\n\n",
-	)
-
 	tools := reg.List()
 	if len(tools) > 0 {
-		sb.WriteString("## Tools\n")
+		sb.WriteString("## Available Tools\n")
 		for _, t := range tools {
-			fmt.Fprintf(&sb, "• %s: %s\n", t.Name, t.Description)
+			fmt.Fprintf(&sb, "- %s: %s\n", t.Name, t.Description)
 			for _, a := range t.Args {
 				req := ""
 				if a.Required {
-					req = " (required)"
+					req = " [required]"
 				}
-				fmt.Fprintf(&sb, "  - %s%s: %s\n", a.Name, req, a.Description)
+				fmt.Fprintf(&sb, "    %s%s: %s\n", a.Name, req, a.Description)
 			}
 		}
-		sb.WriteString("\nExample: <tool_call>exec cmd=\"echo hello\" /></tool_call>\n")
+		sb.WriteString("\n## Standard Tool Call:\n<tool_call>exec cmd=\"echo hello\" /></tool_call>\n")
+		sb.WriteString("## Long Content Tool Call (use for run_python, write_file, append_file):\n" +
+			"<tool_call>write_file path=\"script.py\">\nprint(\"Hello World\")\n" +
+			"print(r\"Regex \\\\d+\")\n</tool_call>\n")
 	}
 	return sb.String()
 }
@@ -344,18 +312,31 @@ func (s *AgentSession) RunStream(ctx context.Context, senderID, userText string,
 	s.mu.Unlock()
 
 	var toolErrors []string
+	// lastFailKey tracks (tool+args) that errored last iteration to detect exact retry loops.
+	lastFailKey := ""
+	sameFailCount := 0
 
 	for i := range s.maxIterations() {
 		s.mu.Lock()
 		history := make([]model.Message, len(s.history))
 		copy(history, s.history)
-		b, _ := json.Marshal(history)
-		ioutil.WriteFile("history.json", b, 0644)
 		s.mu.Unlock()
 
-		reply, err := s.client.Send(ctx, s.model, history)
+		var reply string
+		var err error
+		for attempt := range 3 {
+			reply, err = s.client.Send(ctx, s.model, history)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			log.Printf("[AGENT-STREAM] model error (attempt %d/3): %v — retrying", attempt+1, err)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
 		if err != nil {
-			if err == context.DeadlineExceeded {
+			if ctx.Err() == context.DeadlineExceeded {
 				msg := fmt.Sprintf("[Timeout at iteration %d]", i+1)
 				if onChunk != nil {
 					onChunk(msg)
@@ -396,24 +377,63 @@ func (s *AgentSession) RunStream(ctx context.Context, senderID, userText string,
 
 		if hasSequential || len(toolCalls) == 1 {
 			for _, tc := range toolCalls {
-				log.Printf("[AGENT-STREAM] tool=%s", tc.funcName)
+				if !strings.HasPrefix(tc.funcName, "tg_") {
+					log.Printf("[AGENT-STREAM] tool=%s", tc.funcName)
+				}
+				label := toolLabel(tc.funcName, tc.argsJSON)
+				isTGTool := strings.HasPrefix(tc.funcName, "tg_")
 				autoProgress(senderID, tc.funcName, tc.argsJSON, "running")
-				if onChunk != nil {
-					onChunk(fmt.Sprintf("__TOOL_CALL:%s__\n", tc.funcName))
+				if onChunk != nil && !isTGTool {
+					onChunk(fmt.Sprintf("__TOOL_CALL:%s__\n", label))
 				}
 				result := s.executeTool(tc.funcName, tc.argsJSON, senderID)
-				if onChunk != nil {
-					onChunk(fmt.Sprintf("__TOOL_RESULT:%s__\n", tc.funcName))
+				errStatus := "ok"
+				if isToolError(result) {
+					errSnippet := result
+					if len(errSnippet) > 120 {
+						errSnippet = errSnippet[:120]
+					}
+					errStatus = "err:" + errSnippet
 				}
-				toolMsg := fmt.Sprintf("[Tool result: %s]\n%s\n\nPlease continue.", tc.funcName, result)
+				if onChunk != nil && !isTGTool {
+					onChunk(fmt.Sprintf("__TOOL_RESULT:%s|%s__\n", label, errStatus))
+				}
+
+				failKey := tc.funcName + "|" + tc.argsJSON
 				if isToolError(result) {
 					autoProgress(senderID, tc.funcName, tc.argsJSON, "failure")
-					toolMsg = fmt.Sprintf("[Tool error: %s]\n%s\n\nFix this and retry with a different approach or corrected parameters.", tc.funcName, result)
+					if failKey == lastFailKey {
+						sameFailCount++
+					} else {
+						sameFailCount = 1
+						lastFailKey = failKey
+					}
+
+					var toolMsg string
+					if sameFailCount >= 2 {
+						// Hard stop — inject a final message forcing the AI to give up
+						toolMsg = fmt.Sprintf(
+							"[HARD STOP: %s]\nThis exact call has failed %d times in a row:\n%s\n\nDo NOT retry. Summarize what failed and why in plain language for the user. Do not attempt any further tool calls.",
+							tc.funcName, sameFailCount, result,
+						)
+					} else {
+						toolMsg = fmt.Sprintf(
+							"[Tool error: %s]\n%s\n\nDo NOT retry with the same approach or arguments. Either use a completely different method, or stop and tell the user exactly what failed and why.",
+							tc.funcName, result,
+						)
+					}
 					toolErrors = append(toolErrors, fmt.Sprintf("%s: %s", tc.funcName, result))
+					s.mu.Lock()
+					s.history = append(s.history, model.Message{Role: "user", Content: toolMsg})
+					s.mu.Unlock()
+				} else {
+					lastFailKey = ""
+					sameFailCount = 0
+					toolMsg := fmt.Sprintf("[Tool result: %s]\n%s\n\nContinue.", tc.funcName, result)
+					s.mu.Lock()
+					s.history = append(s.history, model.Message{Role: "user", Content: toolMsg})
+					s.mu.Unlock()
 				}
-				s.mu.Lock()
-				s.history = append(s.history, model.Message{Role: "user", Content: toolMsg})
-				s.mu.Unlock()
 
 				if t, ok := s.registry.Get(tc.funcName); ok && t.BlocksContext {
 					if ctx.Err() != nil {
@@ -453,12 +473,12 @@ func (s *AgentSession) RunStream(ctx context.Context, senderID, userText string,
 
 			var combinedMsg strings.Builder
 			for _, r := range results {
-				msg := fmt.Sprintf("[Tool result: %s]\n%s\n\nPlease continue.", r.funcName, r.result)
 				if isToolError(r.result) {
-					msg = fmt.Sprintf("[Tool error: %s]\n%s\n\nFix this and retry with a different approach or corrected parameters.", r.funcName, r.result)
+					combinedMsg.WriteString(fmt.Sprintf("[Tool error: %s]\n%s\n\nDo NOT retry with the same approach. Use a different method or stop and report.", r.funcName, r.result))
 					toolErrors = append(toolErrors, fmt.Sprintf("%s: %s", r.funcName, r.result))
+				} else {
+					combinedMsg.WriteString(fmt.Sprintf("[Tool result: %s]\n%s\n\nContinue.", r.funcName, r.result))
 				}
-				combinedMsg.WriteString(msg)
 				combinedMsg.WriteString("\n")
 			}
 			s.mu.Lock()
@@ -618,8 +638,12 @@ func (s *AgentSession) executeTool(name, argsJSON, senderID string) string {
 	if !ok {
 		return fmt.Sprintf("unknown tool %q. Available: %s", name, strings.Join(s.registry.Names(), ", "))
 	}
-	if t.Secure && senderID != Cfg.OwnerID && senderID != "web_"+Cfg.OwnerID {
-		log.Printf("[AGENT] access denied: user %q tried secure tool %q", senderID, name)
+	realUserID := senderID
+	if idx := strings.Index(senderID, ":"); idx != -1 {
+		realUserID = senderID[:idx]
+	}
+	if t.Secure && realUserID != Cfg.OwnerID && realUserID != "web_"+Cfg.OwnerID {
+		log.Printf("[AGENT] access denied: user %q tried secure tool %q", realUserID, name)
 		return fmt.Sprintf("Access denied: tool %q is restricted to the bot owner.", name)
 	}
 	var args map[string]string
@@ -639,21 +663,91 @@ func (s *AgentSession) executeTool(name, argsJSON, senderID string) string {
 }
 
 func isToolError(result string) bool {
-	r := strings.TrimSpace(strings.ToLower(result))
-	return strings.HasPrefix(r, "error:") ||
-		strings.HasPrefix(r, "{\"error\"") ||
-		strings.Contains(r, "unknown tool") ||
-		strings.Contains(r, "access denied") ||
-		strings.Contains(r, "permission denied") ||
-		strings.Contains(r, "not found") ||
-		strings.Contains(r, "failed") ||
-		strings.Contains(r, "error") ||
-		strings.Contains(r, "restricted") ||
-		strings.Contains(r, "denied") ||
-		strings.Contains(r, "invalid") ||
-		strings.Contains(r, "failed") ||
-		strings.Contains(r, "cannot") ||
-		strings.Contains(r, "couldn't")
+	r := strings.TrimSpace(result)
+	rl := strings.ToLower(r)
+	// Only match on clear error prefixes — do NOT use Contains to avoid false positives
+	// on tool results that happen to mention words like "failed" or "not found" in content.
+	return strings.HasPrefix(rl, "error:") ||
+		strings.HasPrefix(rl, "{\"error\"") ||
+		strings.HasPrefix(rl, "[error]") ||
+		strings.HasPrefix(rl, "fatal:") ||
+		strings.HasPrefix(rl, "unknown tool") ||
+		strings.HasPrefix(rl, "access denied") ||
+		strings.HasPrefix(rl, "permission denied") ||
+		strings.HasPrefix(rl, "restricted:") ||
+		(len(r) < 300 && (strings.HasPrefix(rl, "failed to") || strings.HasPrefix(rl, "cannot ") || strings.HasPrefix(rl, "couldn't ")))
+}
+
+// toolLabel returns a short human-readable description of a tool call.
+func toolLabel(name, argsJSON string) string {
+	var args map[string]string
+	json.Unmarshal([]byte(argsJSON), &args)
+
+	short := func(s string, n int) string {
+		if len(s) > n {
+			return s[:n] + "..."
+		}
+		return s
+	}
+	domain := func(u string) string {
+		u = strings.TrimPrefix(u, "https://")
+		u = strings.TrimPrefix(u, "http://")
+		if idx := strings.Index(u, "/"); idx > 0 {
+			return u[:idx]
+		}
+		return u
+	}
+
+	switch name {
+	case "exec":
+		if cmd := args["cmd"]; cmd != "" {
+			return "run: " + short(cmd, 60)
+		}
+	case "run_python":
+		if code := args["code"]; code != "" {
+			first := strings.SplitN(strings.TrimSpace(code), "\n", 2)[0]
+			return "python: " + short(first, 60)
+		}
+	case "write_file":
+		if p := args["path"]; p != "" {
+			return "write " + filepath.Base(p)
+		}
+	case "append_file":
+		if p := args["path"]; p != "" {
+			return "append " + filepath.Base(p)
+		}
+	case "read_file":
+		if p := args["path"]; p != "" {
+			return "read " + filepath.Base(p)
+		}
+	case "web_fetch", "http_request", "tavily_extract":
+		if u := args["url"]; u != "" {
+			return "fetch " + domain(u)
+		}
+	case "tavily_search", "web_search":
+		if q := args["query"]; q != "" {
+			return "search: " + short(q, 50)
+		}
+	case "github_read_file":
+		if p := args["path"]; p != "" {
+			return "github: " + short(p, 50)
+		}
+	case "tg_send_message":
+		return "send message"
+	case "tg_send_file":
+		return "send file"
+	case "schedule_task":
+		if l := args["label"]; l != "" {
+			return "schedule: " + l
+		}
+	case "deep_work":
+		return "planning"
+	case "progress":
+		if m := args["message"]; m != "" {
+			return short(m, 60)
+		}
+	}
+	return name
 }
 
 func cleanReply(s string) string {
@@ -705,7 +799,89 @@ func DeleteAgentSession(key string) {
 }
 
 var toolCallRe = regexp.MustCompile(`(?s)<tool_call>(.*?)(?:/>|</tool_call>)`)
-var attrRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
+
+// parseInnerToolCall parses `funcName attr="val">body content` manually
+// tracking quotes to avoid treating `>` inside an attribute as the tag closer.
+func parseInnerToolCall(inner string) (funcName string, kv map[string]string, valContent string) {
+	kv = make(map[string]string)
+	s := strings.TrimSpace(inner)
+
+	i := 0
+	// skip space
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+
+	// read funcName
+	start := i
+	for i < len(s) && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' && s[i] != '>' {
+		i++
+	}
+	funcName = s[start:i]
+
+	// read attributes
+	for i < len(s) && s[i] != '>' {
+		// skip space
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+			i++
+		}
+		if i >= len(s) || s[i] == '>' {
+			break
+		}
+
+		// read key
+		kStart := i
+		for i < len(s) && s[i] != '=' && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r' && s[i] != '>' {
+			i++
+		}
+		key := s[kStart:i]
+		if key == "" {
+			i++
+			continue
+		}
+
+		// skip space to '='
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+			i++
+		}
+		if i >= len(s) || s[i] == '>' {
+			break
+		}
+
+		if s[i] == '=' {
+			i++ // skip '='
+			// skip space to double quote
+			for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+				i++
+			}
+			if i < len(s) && s[i] == '"' {
+				i++ // skip opening quote
+				var val strings.Builder
+				for i < len(s) {
+					if s[i] == '\\' && i+1 < len(s) && s[i+1] == '"' {
+						val.WriteByte('"')
+						i += 2
+					} else if s[i] == '"' {
+						i++ // skip closing quote
+						break
+					} else {
+						val.WriteByte(s[i])
+						i++
+					}
+				}
+				if len(key) <= 100 && len(val.String()) <= 100000 {
+					kv[key] = val.String()
+				}
+			}
+		}
+	}
+
+	// if stopped at '>', rest is content
+	if i < len(s) && s[i] == '>' {
+		valContent = strings.TrimSpace(s[i+1:])
+	}
+	return funcName, kv, valContent
+}
 
 type parsedToolCall struct {
 	funcName string
@@ -731,32 +907,25 @@ func parseToolCall(text string) (funcName, argsJSON string, ok bool) {
 		return "", "", false
 	}
 	inner := strings.TrimSpace(m[1])
-	if len(inner) > 10000 {
+	if len(inner) > 800000 {
 		return "", "", false
 	}
-	parts := strings.SplitN(inner, " ", 2)
-	funcName = strings.TrimSpace(parts[0])
-	attrsStr := ""
-	if len(parts) > 1 {
-		attrsStr = parts[1]
-	}
-	attrs := attrRe.FindAllStringSubmatch(attrsStr, -1)
-	kv := make(map[string]string, len(attrs))
-	for _, a := range attrs {
-		if len(a) >= 3 {
-			key := strings.TrimSpace(a[1])
-			val := strings.TrimSpace(a[2])
-			if len(key) > 100 || len(val) > 100000 {
-				continue
-			}
-			kv[key] = val
+
+	fnName, kv, valContent := parseInnerToolCall(inner)
+
+	if valContent != "" {
+		if fnName == "run_python" {
+			kv["code"] = valContent
+		} else if fnName == "write_file" || fnName == "append_file" || fnName == "progress" {
+			kv["content"] = valContent
 		}
 	}
-	if !isValidToolCall(funcName, kv) {
+
+	if !isValidToolCall(fnName, kv) {
 		return "", "", false
 	}
 	b, _ := json.Marshal(kv)
-	return funcName, string(b), true
+	return fnName, string(b), true
 }
 
 func parseAllToolCalls(text string) []parsedToolCall {
@@ -764,33 +933,26 @@ func parseAllToolCalls(text string) []parsedToolCall {
 	result := make([]parsedToolCall, 0, len(matches))
 	for _, m := range matches {
 		inner := strings.TrimSpace(m[1])
-		if len(inner) > 10000 {
+		if len(inner) > 800000 {
 			continue
 		}
-		parts := strings.SplitN(inner, " ", 2)
-		funcName := strings.TrimSpace(parts[0])
-		attrsStr := ""
-		if len(parts) > 1 {
-			attrsStr = parts[1]
-		}
-		attrs := attrRe.FindAllStringSubmatch(attrsStr, -1)
-		kv := make(map[string]string, len(attrs))
-		for _, a := range attrs {
-			if len(a) >= 3 {
-				key := strings.TrimSpace(a[1])
-				val := strings.TrimSpace(a[2])
-				if len(key) > 100 || len(val) > 100000 {
-					continue
-				}
-				kv[key] = val
+
+		fnName, kv, valContent := parseInnerToolCall(inner)
+
+		if valContent != "" {
+			if fnName == "run_python" {
+				kv["code"] = valContent
+			} else if fnName == "write_file" || fnName == "append_file" || fnName == "progress" {
+				kv["content"] = valContent
 			}
 		}
-		if !isValidToolCall(funcName, kv) {
+
+		if !isValidToolCall(fnName, kv) {
 			continue
 		}
 		b, _ := json.Marshal(kv)
 		result = append(result, parsedToolCall{
-			funcName: funcName,
+			funcName: fnName,
 			argsJSON: string(b),
 		})
 	}

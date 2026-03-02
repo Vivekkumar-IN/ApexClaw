@@ -1,7 +1,6 @@
 package core
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -200,33 +199,11 @@ func repeatStr(s string, n int) string {
 	return result.String()
 }
 
-// autoProgress fires a single-line progress update for automatic tool-execution tracking.
-// Skips tools that manage progress themselves (progress, deep_work).
+// autoProgress is intentionally a no-op.
+// The stream handler in telegram.go owns all Telegram output (working... / final result).
+// Tool-level progress is tracked there via __TOOL_CALL: chunks, not here.
+// The explicit `progress` tool (called by the AI) still works via SendProgressFn directly.
 func autoProgress(senderID, toolName, argsJSON, state string) {
-	if tools.SendProgressFn == nil {
-		return
-	}
-	switch toolName {
-	case "progress", "deep_work":
-		return
-	}
-
-	// Extract a short detail label from the most meaningful arg
-	detail := ""
-	var args map[string]string
-	if json.Unmarshal([]byte(argsJSON), &args) == nil {
-		for _, key := range []string{"cmd", "url", "path", "query", "peer", "text", "file_path", "name"} {
-			if v := args[key]; v != "" {
-				if len(v) > 80 {
-					v = v[:80] + "..."
-				}
-				detail = v
-				break
-			}
-		}
-	}
-
-	tools.SendProgressFn(senderID, 0, toolName, state, detail)
 }
 
 func escapeHTML(s string) string {

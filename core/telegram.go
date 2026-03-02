@@ -43,6 +43,12 @@ func setTelegramContext(userID string, ctx map[string]any) {
 	ctxMu.Unlock()
 }
 
+func deleteTelegramContext(userID string) {
+	ctxMu.Lock()
+	delete(msgCtx, userID)
+	ctxMu.Unlock()
+}
+
 func getTelegramContext(userID string) map[string]any {
 	ctxMu.Lock()
 	defer ctxMu.Unlock()
@@ -345,8 +351,11 @@ func (b *TelegramBot) handleText(m *telegram.NewMessage, text string) error {
 	}
 
 	log.Printf("[TG] msg from %s (chat %d): %q", userID, m.ChatID(), truncate(text, 80))
+	requestID := fmt.Sprintf("%s:%d:%d", userID, m.ChatID(), m.ID)
 	msgCtxData := buildMsgContext(m, userID, nil)
-	setTelegramContext(userID, msgCtxData)
+	setTelegramContext(requestID, msgCtxData)
+	defer deleteTelegramContext(requestID)
+
 	ctxPrefix := formatTGContext(msgCtxData)
 	if ctxPrefix != "" {
 		text = ctxPrefix + "\n" + text
@@ -357,26 +366,25 @@ func (b *TelegramBot) handleText(m *telegram.NewMessage, text string) error {
 
 	b.sendTyping(m)
 	session := GetOrCreateAgentSession(userID)
-	onChunk, _, done := b.newStreamHandler(m.ChatID(), int64(m.ID), userID)
-	result, err := session.RunStream(timeoutCtx, userID, text, onChunk)
+	onChunk, _, done := b.newStreamHandler(m.ChatID(), int64(m.ID), requestID)
+	result, err := session.RunStream(timeoutCtx, requestID, text, onChunk)
 
 	if err != nil {
 		done()
 		log.Printf("[TG] agent error for %s: %v", userID, err)
-		_, _ = m.Reply("⚠️ Something went wrong. Please try again.")
+		b.safeSendText(m.ChatID(), 0, "Something went wrong. Please try again.")
 		return nil
 	}
 
 	result = cleanResultForTelegram(result)
 
 	if strings.Contains(result, "[MAX_ITERATIONS]") {
-		done()
 		explanation := strings.TrimSpace(strings.Replace(result, "[MAX_ITERATIONS]\n", "", 1))
 		if explanation == "" {
-			explanation = "Hit iteration limit before completing the task."
+			explanation = "Could not complete the task — hit iteration limit."
 		}
-		_, _ = m.Reply(explanation, &telegram.SendOptions{ParseMode: telegram.HTML})
-		return nil
+		// Put it into the finalBuf so done() sends it
+		onChunk(explanation)
 	}
 
 	done()
@@ -576,29 +584,127 @@ func (b *TelegramBot) safeSendText(chatID int64, replyToMsgID int64, text string
 }
 
 // newStreamHandler returns (onChunk, flush, done).
-// flush: sends buffered text mid-stream (does NOT clear progress).
-// done: final call — clears progress message then flushes remaining buffer.
+// Shows a live numbered step log ("1. fetch github.com — done", "2. write igdl2.py — failed: ...").
+// Single progress message, edited in place, deleted when done. Final reply sent as one clean message.
 func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderID string) (func(string), func(), func()) {
-	var buf strings.Builder
-
-	flush := func() {
-		if buf.Len() == 0 {
-			return
-		}
-		b.safeSendText(chatID, replyToMsgID, buf.String())
-		buf.Reset()
+	type stepEntry struct {
+		label  string
+		status string // "running", "done", "failed: ..."
 	}
 
-	done := func() {
-		clearProgressMsg(senderID)
-		flush()
+	var (
+		progressMsgID int32
+		steps         []stepEntry
+		lastEditAt    time.Time
+		finalBuf      strings.Builder
+		mu            sync.Mutex
+	)
+
+	sendProgressMsg := func(text string) int32 {
+		opts := &telegram.SendOptions{ParseMode: telegram.HTML}
+		if replyToMsgID > 0 {
+			opts.ReplyID = int32(replyToMsgID)
+		}
+		m, err := b.client.SendMessage(chatID, text, opts)
+		if err != nil {
+			return 0
+		}
+		return int32(m.ID)
+	}
+
+	var lastUIUpdateSteps int
+
+	buildProgressText := func() string {
+		if len(steps) == 0 {
+			return "working..."
+		}
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Working... (actions taken: %d)\n\n", len(steps))
+
+		show := steps
+		if len(show) > 3 {
+			show = show[len(show)-3:]
+		}
+
+		for _, s := range show {
+			switch {
+			case s.status == "running":
+				fmt.Fprintf(&sb, "- %s [running]\n", escapeHTML(s.label))
+			case s.status == "done":
+				fmt.Fprintf(&sb, "- %s [done]\n", escapeHTML(s.label))
+			case strings.HasPrefix(s.status, "failed:"):
+				errText := strings.TrimPrefix(s.status, "failed:")
+				errText = strings.TrimSpace(errText)
+				if len(errText) > 80 {
+					errText = errText[:80] + "..."
+				}
+				fmt.Fprintf(&sb, "- %s [failed]\n  <code>%s</code>\n", escapeHTML(s.label), escapeHTML(errText))
+			}
+		}
+		return strings.TrimRight(sb.String(), "\n")
+	}
+
+	editProgress := func(force bool) {
+		mu.Lock()
+		msgID := progressMsgID
+		text := buildProgressText()
+		mustSend := progressMsgID == 0
+		shouldEdit := force || (len(steps)-lastUIUpdateSteps >= 3) || time.Since(lastEditAt) > 4*time.Second
+		mu.Unlock()
+
+		if mustSend {
+			id := sendProgressMsg(text)
+			mu.Lock()
+			if progressMsgID == 0 {
+				progressMsgID = id
+				lastEditAt = time.Now()
+				lastUIUpdateSteps = len(steps)
+			}
+			mu.Unlock()
+		} else if msgID != 0 && shouldEdit {
+			b.client.EditMessage(chatID, msgID, text, &telegram.SendOptions{ParseMode: telegram.HTML})
+			mu.Lock()
+			lastEditAt = time.Now()
+			lastUIUpdateSteps = len(steps)
+			mu.Unlock()
+		}
 	}
 
 	onChunk := func(chunk string) {
-		if strings.HasPrefix(chunk, "__TOOL_CALL:") || strings.HasPrefix(chunk, "__TOOL_RESULT:") {
+		if after, ok := strings.CutPrefix(chunk, "__TOOL_CALL:"); ok {
+			label := strings.TrimSuffix(after, "__\n")
+			mu.Lock()
+			steps = append(steps, stepEntry{label: label, status: "running"})
+			mu.Unlock()
+			editProgress(false)
 			return
 		}
-		// Strip \x00PROGRESS:...\x00 blocks
+		if after, ok := strings.CutPrefix(chunk, "__TOOL_RESULT:"); ok {
+			raw := strings.TrimSuffix(after, "__\n")
+			// format: "label|ok" or "label|err:..."
+			label, statusRaw, _ := strings.Cut(raw, "|")
+
+			hasErr := false
+			mu.Lock()
+			for i := len(steps) - 1; i >= 0; i-- {
+				if steps[i].label == label && steps[i].status == "running" {
+					if statusRaw == "ok" {
+						steps[i].status = "done"
+					} else {
+						errMsg := strings.TrimPrefix(statusRaw, "err:")
+						steps[i].status = "failed: " + errMsg
+						hasErr = true
+					}
+					break
+				}
+			}
+			mu.Unlock()
+			editProgress(hasErr)
+			return
+		}
+
+		// Strip \x00PROGRESS:...\x00 markers (from web UI progress tool)
 		for {
 			start := strings.Index(chunk, "\x00PROGRESS:")
 			if start == -1 {
@@ -611,13 +717,51 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 			}
 			chunk = chunk[:start] + chunk[start+1+end+1:]
 		}
+
 		chunk = strings.TrimSpace(chunk)
 		if chunk == "" {
 			return
 		}
-		buf.WriteString(chunk)
-		if buf.Len() >= 800 || strings.Contains(chunk, "\n\n") {
-			flush()
+		mu.Lock()
+		finalBuf.WriteString(chunk)
+		finalBuf.WriteString("\n")
+		mu.Unlock()
+	}
+
+	flush := func() {} // no-op — everything batched until done
+
+	done := func() {
+		clearProgressMsg(senderID)
+
+		mu.Lock()
+		msgID := progressMsgID
+		result := strings.TrimSpace(finalBuf.String())
+		mu.Unlock()
+
+		// Delete progress message silently
+		if msgID != 0 {
+			b.client.DeleteMessages(chatID, []int32{msgID})
+		}
+
+		if result == "" {
+			return
+		}
+
+		// Split at newline boundaries at max 3800 chars
+		const maxLen = 3800
+		for len(result) > 0 {
+			chunk := result
+			if len(chunk) > maxLen {
+				cut := strings.LastIndex(result[:maxLen], "\n")
+				if cut < 100 {
+					cut = maxLen
+				}
+				chunk = result[:cut]
+				result = strings.TrimSpace(result[cut:])
+			} else {
+				result = ""
+			}
+			b.safeSendText(chatID, 0, chunk)
 		}
 	}
 
