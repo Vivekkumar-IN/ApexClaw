@@ -23,7 +23,6 @@ var All = []*ToolDef{
 	RunPython,
 
 	DeepWork,
-	Progress,
 
 	ReadFile,
 	WriteFile,

@@ -269,7 +269,7 @@ func (b *TelegramBot) Start() error {
 		result, err := session.RunStream(timeoutCtx, userID, fullMsg, func(string) {})
 		if err != nil {
 			log.Printf("[TG] inline agent error for %s: %v", userID, err)
-			is.Edit("⚠️ Something went wrong processing your query.")
+			is.Edit("Error: Something went wrong processing your query.")
 			return nil
 		}
 
@@ -412,7 +412,7 @@ func (b *TelegramBot) handleVoice(m *telegram.NewMessage) error {
 	audioPath, err := m.Download()
 	if err != nil {
 		log.Printf("[TG] voice download error: %v", err)
-		_, _ = m.Reply("⚠️ Failed to download voice message.")
+		_, _ = m.Reply("Error: Failed to download voice message.")
 		return nil
 	}
 	defer os.Remove(audioPath)
@@ -420,7 +420,7 @@ func (b *TelegramBot) handleVoice(m *telegram.NewMessage) error {
 	transcribed, err := transcribeAudio(audioPath)
 	if err != nil {
 		log.Printf("[TG] transcription error: %v", err)
-		_, _ = m.Reply("⚠️ Could not transcribe voice message. Try typing your message.")
+		_, _ = m.Reply("Error: Could not transcribe voice message. Try typing your message.")
 		return nil
 	}
 
@@ -442,7 +442,7 @@ func (b *TelegramBot) handleVoice(m *telegram.NewMessage) error {
 
 	if err != nil {
 		log.Printf("[TG] agent error for voice: %v", err)
-		_, _ = m.Reply("⚠️ Something went wrong processing your voice message.")
+		_, _ = m.Reply("Error: Something went wrong processing your voice message.")
 	}
 	return nil
 }
@@ -469,7 +469,7 @@ func (b *TelegramBot) handleFile(m *telegram.NewMessage) error {
 	filePath, err := m.Download()
 	if err != nil {
 		log.Printf("[TG] file download error: %v", err)
-		_, _ = m.Reply("⚠️ Failed to download your file.")
+		_, _ = m.Reply("Error: Failed to download your file.")
 		return nil
 	}
 	defer os.Remove(filePath)
@@ -495,7 +495,7 @@ func (b *TelegramBot) handleFile(m *telegram.NewMessage) error {
 	session := GetOrCreateAgentSession(userID)
 	if _, err = session.Run(ctx, userID, caption); err != nil {
 		log.Printf("[TG] agent error for file: %v", err)
-		_, _ = m.Reply("⚠️ Something went wrong processing the file.")
+		_, _ = m.Reply("Error: Something went wrong processing the file.")
 	}
 	return nil
 }
@@ -538,13 +538,15 @@ func cleanResultForTelegram(result string) string {
 }
 
 func stripMarkdown(s string) string {
-	s = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(s, "<b>$1</b>")
-	s = regexp.MustCompile(`\*(.+?)\*`).ReplaceAllString(s, "<i>$1</i>")
-	s = regexp.MustCompile(`__(.+?)__`).ReplaceAllString(s, "<b>$1</b>")
-	s = regexp.MustCompile("`([^`]+)`").ReplaceAllString(s, "<code>$1</code>")
-	s = regexp.MustCompile(`^#+\s+`).ReplaceAllString(s, "")
-	s = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`).ReplaceAllString(s, "$1")
-	s = strings.TrimLeft(s, "- > *`#")
+	// Remove markdown syntax, keep content
+	s = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(s, "<b>$1</b>")                             // **bold** → bold
+	s = regexp.MustCompile(`\*(.+?)\*`).ReplaceAllString(s, "<i>$1</i>")                                 // *italic* → italic
+	s = regexp.MustCompile(`__(.+?)__`).ReplaceAllString(s, "<b>$1</b>")                                 // __bold__ → bold
+	s = regexp.MustCompile("```[a-z]*\n(.+?)\n```").ReplaceAllString(s, "<pre language=\"$1\">$2</pre>") // ```code``` → code
+	s = regexp.MustCompile("`([^`]+)`").ReplaceAllString(s, "<code>$1</code>")                           // `code` → code
+	s = regexp.MustCompile(`^#+\s+`).ReplaceAllString(s, "")                                             // # heading → heading
+	s = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`).ReplaceAllString(s, "<a href=\"$2\">$1</a>")       // [text](url) → text
+	s = regexp.MustCompile(`\n\n+`).ReplaceAllString(s, "\n")                                            // Multiple newlines → single
 	return s
 }
 
@@ -616,30 +618,33 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 
 	buildProgressText := func() string {
 		if len(steps) == 0 {
-			return "working..."
+			return "Starting..."
 		}
 
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "Working... (actions taken: %d)\n\n", len(steps))
+		fmt.Fprintf(&sb, "Working... (step %d)\n\n", len(steps))
 
 		show := steps
-		if len(show) > 3 {
-			show = show[len(show)-3:]
+		if len(show) > 5 {
+			show = show[len(show)-5:]
 		}
 
-		for _, s := range show {
+		for i, s := range show {
 			switch {
 			case s.status == "running":
-				fmt.Fprintf(&sb, "- %s [running]\n", escapeHTML(s.label))
+				fmt.Fprintf(&sb, "[RUNNING] %s\n", escapeHTML(s.label))
 			case s.status == "done":
-				fmt.Fprintf(&sb, "- %s [done]\n", escapeHTML(s.label))
+				fmt.Fprintf(&sb, "[DONE] %s\n", escapeHTML(s.label))
 			case strings.HasPrefix(s.status, "failed:"):
 				errText := strings.TrimPrefix(s.status, "failed:")
 				errText = strings.TrimSpace(errText)
-				if len(errText) > 80 {
-					errText = errText[:80] + "..."
+				if len(errText) > 60 {
+					errText = errText[:60] + "..."
 				}
-				fmt.Fprintf(&sb, "- %s [failed]\n  <code>%s</code>\n", escapeHTML(s.label), escapeHTML(errText))
+				fmt.Fprintf(&sb, "[FAILED] %s\n   %s\n", escapeHTML(s.label), escapeHTML(errText))
+			}
+			if i < len(show)-1 {
+				fmt.Fprintf(&sb, "\n")
 			}
 		}
 		return strings.TrimRight(sb.String(), "\n")
@@ -728,7 +733,7 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 		mu.Unlock()
 	}
 
-	flush := func() {} // no-op — everything batched until done
+	flush := func() {}
 
 	done := func() {
 		clearProgressMsg(senderID)
@@ -738,7 +743,6 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 		result := strings.TrimSpace(finalBuf.String())
 		mu.Unlock()
 
-		// Delete progress message silently
 		if msgID != 0 {
 			b.client.DeleteMessages(chatID, []int32{msgID})
 		}
@@ -747,7 +751,7 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 			return
 		}
 
-		// Split at newline boundaries at max 3800 chars
+		result = stripMarkdown(result)
 		const maxLen = 3800
 		for len(result) > 0 {
 			chunk := result
@@ -761,7 +765,7 @@ func (b *TelegramBot) newStreamHandler(chatID int64, replyToMsgID int64, senderI
 			} else {
 				result = ""
 			}
-			b.safeSendText(chatID, 0, chunk)
+			b.safeSendText(chatID, replyToMsgID, chunk)
 		}
 	}
 
@@ -842,7 +846,7 @@ func (b *TelegramBot) handleStart(m *telegram.NewMessage) error {
 		"/tasks — list scheduled tasks\n" +
 		"/tools — list tools"
 	if userID == Cfg.OwnerID {
-		msg += "\n\n🛠️ Sudo Management:\n" +
+		msg += "\n\nSudo Management:\n" +
 			"/addsudo — Add a sudo user\n" +
 			"/rmsudo — Remove a sudo user\n" +
 			"/listsudo — List all sudo users"
@@ -857,7 +861,7 @@ func (b *TelegramBot) handleReset(m *telegram.NewMessage) error {
 		return nil
 	}
 	GetOrCreateAgentSession(userID).Reset()
-	_, err := m.Reply("🔄 Conversation cleared.")
+	_, err := m.Reply("Conversation cleared.")
 	return err
 }
 
@@ -945,7 +949,7 @@ func handleWebCodeCommand(m *telegram.NewMessage, parts []string) error {
 		}
 		newCode := parts[2]
 		if !regexp.MustCompile(`^\d{6}$`).MatchString(newCode) {
-			_, err := m.Reply("❌ Code must be exactly 6 digits.")
+			_, err := m.Reply("Error: Code must be exactly 6 digits.")
 			return err
 		}
 		oldCode := Cfg.WebLoginCode
@@ -957,7 +961,7 @@ func handleWebCodeCommand(m *telegram.NewMessage, parts []string) error {
 		envMap["WEB_LOGIN_CODE"] = newCode
 		envMap["WEB_FIRST_LOGIN"] = "false"
 		godotenv.Write(envMap, ".env")
-		_, err := m.Reply(fmt.Sprintf("✅ Web login code changed!\nOld: `%s`\nNew: `%s`", oldCode, newCode))
+		_, err := m.Reply(fmt.Sprintf("Web login code changed!\nOld: `%s`\nNew: `%s`", oldCode, newCode))
 		return err
 
 	case "random":
@@ -994,7 +998,7 @@ func (b *TelegramBot) handleSudoCommands(m *telegram.NewMessage, parts []string)
 		}
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "👑 <b>Owner:</b> <code>%s</code>\n", Cfg.OwnerID)
-		fmt.Fprintf(&sb, "🛠️ <b>Sudo Users (%d):</b>\n", len(Cfg.SudoIDs))
+		fmt.Fprintf(&sb, "<b>Sudo Users (%d):</b>\n", len(Cfg.SudoIDs))
 		for _, id := range Cfg.SudoIDs {
 			fmt.Fprintf(&sb, "• <code>%s</code>\n", id)
 		}
@@ -1027,7 +1031,7 @@ func (b *TelegramBot) handleSudoCommands(m *telegram.NewMessage, parts []string)
 		return err
 	}
 	if targetID == Cfg.OwnerID {
-		_, err := m.Reply("❌ That's the owner!")
+		_, err := m.Reply("Error: That's the owner!")
 		return err
 	}
 
@@ -1041,11 +1045,11 @@ func (b *TelegramBot) handleSudoCommands(m *telegram.NewMessage, parts []string)
 
 	if strings.Contains(cmd, "addsudo") {
 		if slices.Contains(currentSudos, targetID) {
-			_, err := m.Reply(fmt.Sprintf("✅ user <code>%s</code> is already a sudo user.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
+			_, err := m.Reply(fmt.Sprintf("User <code>%s</code> is already a sudo user.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
 			return err
 		}
 		newSudos = append(currentSudos, targetID)
-		_, _ = m.Reply(fmt.Sprintf("✅ Added <code>%s</code> to sudo users.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
+		_, _ = m.Reply(fmt.Sprintf("Added <code>%s</code> to sudo users.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
 	} else if strings.Contains(cmd, "rmsudo") {
 		found := false
 		for _, s := range currentSudos {
@@ -1056,10 +1060,10 @@ func (b *TelegramBot) handleSudoCommands(m *telegram.NewMessage, parts []string)
 			}
 		}
 		if !found {
-			_, err := m.Reply(fmt.Sprintf("❌ user <code>%s</code> is not a sudo user.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
+			_, err := m.Reply(fmt.Sprintf("Error: User <code>%s</code> is not a sudo user.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
 			return err
 		}
-		_, _ = m.Reply(fmt.Sprintf("✅ Removed <code>%s</code> from sudo users.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
+		_, _ = m.Reply(fmt.Sprintf("Removed <code>%s</code> from sudo users.", targetID), &telegram.SendOptions{ParseMode: telegram.HTML})
 	}
 
 	Cfg.SudoIDs = newSudos

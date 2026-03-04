@@ -8,53 +8,74 @@ import (
 	"os"
 	osexec "os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var Exec = &ToolDef{
 	Name:        "exec",
-	Description: "Run a shell/system command. Returns combined stdout+stderr.",
+	Description: "Run a shell/system command. Returns combined stdout+stderr. Auto-detects long-running commands (npm install, pip install, etc) and increases timeout.",
 	Secure:      true,
 	Args: []ToolArg{
 		{Name: "cmd", Description: "Shell command to execute", Required: true},
-		{Name: "timeout", Description: "Timeout in seconds (default 30, max 300)", Required: false},
+		{Name: "timeout", Description: "Timeout in seconds (default: auto-detect, min 30, max 600)", Required: false},
 	},
 	Execute: func(args map[string]string) string {
 		cmd := args["cmd"]
 		if cmd == "" {
 			return "Error: cmd is required"
 		}
+
 		timeoutSec := 30
-		if t := args["timeout"]; t != "" {
-			fmt.Sscanf(t, "%d", &timeoutSec)
-		}
-		if timeoutSec > 300 {
+		if strings.Contains(cmd, "npm install") || strings.Contains(cmd, "npm i ") ||
+			strings.Contains(cmd, "pip install") || strings.Contains(cmd, "pip3 install") ||
+			strings.Contains(cmd, "go get") || strings.Contains(cmd, "cargo") ||
+			strings.Contains(cmd, "apt-get") || strings.Contains(cmd, "brew") ||
+			strings.Contains(cmd, "yarn install") || strings.Contains(cmd, "bun install") {
 			timeoutSec = 300
 		}
+
+		if t := args["timeout"]; t != "" {
+			if parsedT, err := strconv.Atoi(t); err == nil {
+				timeoutSec = parsedT
+			}
+		}
+		if timeoutSec < 30 {
+			timeoutSec = 30
+		}
+		if timeoutSec > 600 {
+			timeoutSec = 600
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 		defer cancel()
+
+		envVars := os.Environ()
+		envVars = append(envVars, "CI=true", "NPM_CONFIG_PROGRESS=false")
 
 		var out []byte
 		var err error
 		if runtime.GOOS == "windows" {
 			out, err = osexec.CommandContext(ctx, "cmd", "/c", cmd).CombinedOutput()
 		} else {
-			out, err = osexec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+			c := osexec.CommandContext(ctx, "sh", "-c", cmd)
+			c.Env = envVars
+			out, err = c.CombinedOutput()
 		}
 
 		result := strings.TrimSpace(string(out))
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Sprintf("Timeout after %ds.\n%s", timeoutSec, result)
+			return fmt.Sprintf("Error: Timeout after %ds.\n%s", timeoutSec, result)
 		}
 		if err != nil {
-			return fmt.Sprintf("Exit error: %v\n%s", err, result)
+			return fmt.Sprintf("Error: Exit error: %v\n%s", err, result)
 		}
 		if len(result) > 8000 {
 			result = result[:8000] + "\n...(truncated)"
 		}
 		if result == "" {
-			return "(no output)"
+			return "(completed)"
 		}
 		return result
 	},
@@ -107,10 +128,15 @@ var ExecChain = &ToolDef{
 
 		timeoutSec := 60
 		if t := args["timeout"]; t != "" {
-			fmt.Sscanf(t, "%d", &timeoutSec)
+			if parsedT, err := strconv.Atoi(t); err == nil {
+				timeoutSec = parsedT
+			}
 		}
-		if timeoutSec > 300 {
-			timeoutSec = 300
+		if timeoutSec < 30 {
+			timeoutSec = 30
+		}
+		if timeoutSec > 600 {
+			timeoutSec = 600
 		}
 
 		stopOnError := args["stop_on_error"] != "false"
@@ -119,12 +145,21 @@ var ExecChain = &ToolDef{
 		total := len(commands)
 
 		for i, cmd := range commands {
+			cmdTimeout := timeoutSec
+			if strings.Contains(cmd, "npm install") || strings.Contains(cmd, "npm i ") ||
+				strings.Contains(cmd, "pip install") || strings.Contains(cmd, "pip3 install") ||
+				strings.Contains(cmd, "go get") || strings.Contains(cmd, "cargo") ||
+				strings.Contains(cmd, "apt-get") || strings.Contains(cmd, "brew") ||
+				strings.Contains(cmd, "yarn install") || strings.Contains(cmd, "bun install") {
+				cmdTimeout = 300
+			}
+
 			start := time.Now()
-			result, cmdErr, timedOut := runShellCmd(cmd, timeoutSec)
+			result, cmdErr, timedOut := runShellCmd(cmd, cmdTimeout)
 			elapsed := time.Since(start)
 
 			if timedOut {
-				results = append(results, fmt.Sprintf("[%d/%d] %s → TIMEOUT (%.1fs)\n%s", i+1, total, cmd, elapsed.Seconds(), result))
+				results = append(results, fmt.Sprintf("[%d/%d] TIMEOUT after %ds\n%s\n%s", i+1, total, cmdTimeout, cmd, result))
 				if stopOnError {
 					break
 				}
@@ -132,7 +167,7 @@ var ExecChain = &ToolDef{
 			}
 
 			if cmdErr != nil {
-				results = append(results, fmt.Sprintf("[%d/%d] %s → FAIL (%.1fs)\n%s", i+1, total, cmd, elapsed.Seconds(), result))
+				results = append(results, fmt.Sprintf("[%d/%d] FAILED (%.1fs)\n%s\n%s", i+1, total, elapsed.Seconds(), cmd, result))
 				if stopOnError {
 					break
 				}
@@ -146,7 +181,10 @@ var ExecChain = &ToolDef{
 			if output == "" {
 				output = "(ok)"
 			}
-			results = append(results, fmt.Sprintf("[%d/%d] %s → OK (%.1fs)\n%s", i+1, total, cmd, elapsed.Seconds(), output))
+			results = append(results, fmt.Sprintf("[%d/%d] OK (%.1fs)\n%s", i+1, total, elapsed.Seconds(), cmd))
+			if output != "(ok)" {
+				results[len(results)-1] += fmt.Sprintf("\n%s", output)
+			}
 		}
 
 		return strings.Join(results, "\n\n")

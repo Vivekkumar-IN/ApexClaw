@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -65,87 +64,6 @@ func RegisterBuiltinTools(reg *ToolRegistry) {
 			Execute:            t.Execute,
 			ExecuteWithContext: t.ExecuteWithContext,
 		})
-	}
-
-	tools.SetDeepWorkFn = func(senderID string, maxSteps int, plan string) string {
-		agentSessions.RLock()
-		var session *AgentSession
-		for key, s := range agentSessions.m {
-			if key == senderID || key == "web_"+senderID {
-				session = s
-				break
-			}
-		}
-		agentSessions.RUnlock()
-
-		if session == nil {
-			return "Error: session not found"
-		}
-		session.SetDeepWork(maxSteps, plan)
-		return fmt.Sprintf("Deep work activated! Plan: %s\nMax steps: %d\nYou now have extended iterations. Proceed with your plan.", plan, maxSteps)
-	}
-
-	tools.SendProgressFn = func(senderID string, percent int, message string, state string, detail string) (int64, error) {
-		agentSessions.RLock()
-		var session *AgentSession
-		for key, s := range agentSessions.m {
-			if key == senderID || key == "web_"+senderID {
-				session = s
-				break
-			}
-		}
-		agentSessions.RUnlock()
-
-		// Send WebUI progress
-		if session != nil && session.streamCallback != nil {
-			progressJSON := fmt.Sprintf(`{"message":"%s","percent":%d,"state":"%s","detail":"%s"}`,
-				escapeJSON(message), percent, state, escapeJSON(detail))
-			session.streamCallback(fmt.Sprintf("\x00PROGRESS:%s\x00", progressJSON))
-		}
-
-		// Edit-in-place Telegram progress message
-		tgCtx := getTelegramContext(senderID)
-		if tgCtx == nil {
-			return 0, nil
-		}
-		chatID, ok := tgCtx["telegram_id"].(int64)
-		if !ok {
-			return 0, nil
-		}
-
-		var text strings.Builder
-		fmt.Fprintf(&text, "[%s] <b>%s</b>", state, escapeHTML(message))
-		if detail != "" && detail != "(no output)" {
-			lines := splitLines(detail, 3)
-			for _, line := range lines {
-				fmt.Fprintf(&text, "\n<code>%s</code>", escapeHTML(line))
-			}
-		}
-
-		progressMu.Lock()
-		p := progressMsgs[senderID]
-		if p != nil && (p.msgID > 0 || p.sending) && p.chatID == chatID {
-			msgID := p.msgID
-			progressMu.Unlock()
-			if msgID > 0 {
-				tgEditRaw(chatID, msgID, text.String())
-			}
-		} else {
-			entry := &progressEntry{chatID: chatID, sending: true}
-			progressMsgs[senderID] = entry
-			progressMu.Unlock()
-
-			newID := tgSendRaw(chatID, text.String())
-
-			progressMu.Lock()
-			if progressMsgs[senderID] == entry {
-				entry.msgID = newID
-				entry.sending = false
-			}
-			progressMu.Unlock()
-		}
-
-		return 0, nil
 	}
 
 	tools.GetTelegramContextFn = getTelegramContext
