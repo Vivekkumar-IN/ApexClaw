@@ -23,6 +23,7 @@ var All = []*ToolDef{
 	RunPython,
 
 	DeepWork,
+	DebugTrace,
 
 	ReadFile,
 	WriteFile,
@@ -38,6 +39,11 @@ var All = []*ToolDef{
 	ListFacts,
 	DeleteFact,
 	UpdateNote,
+
+	KBAdd,
+	KBSearch,
+	KBList,
+	KBDelete,
 
 	WebFetch,
 	WebSearch,
@@ -164,6 +170,7 @@ var All = []*ToolDef{
 
 	NewsHeadlines,
 	RedditFeed,
+	RedditThread,
 	YouTubeSearch,
 	ReadEmail,
 	SendEmail,

@@ -34,7 +34,7 @@ func New() *Client {
 			return net.Dial(network, addr)
 		},
 	}
-	return &Client{http: &http.Client{Timeout: 90 * time.Second, Transport: transport}}
+	return &Client{http: &http.Client{Timeout: 5 * time.Minute, Transport: transport}}
 }
 
 func NewWithCustomDialer(dialer *net.Dialer) *Client {
@@ -45,7 +45,7 @@ func NewWithCustomDialer(dialer *net.Dialer) *Client {
 			return dialer.DialContext(ctx, network, addr)
 		},
 	}
-	return &Client{http: &http.Client{Timeout: 90 * time.Second, Transport: transport}}
+	return &Client{http: &http.Client{Timeout: 5 * time.Minute, Transport: transport}}
 }
 
 const (

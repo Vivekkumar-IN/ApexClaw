@@ -303,3 +303,185 @@ var YouTubeSearch = &ToolDef{
 		return strings.TrimRight(sb.String(), "\n")
 	},
 }
+
+type redditComment struct {
+	Data struct {
+		Author  string `json:"author"`
+		Body    string `json:"body"`
+		Score   int    `json:"score"`
+		Created int64  `json:"created_utc"`
+	} `json:"data"`
+	Kind string `json:"kind"`
+}
+
+type redditThread struct {
+	Data struct {
+		Children []struct {
+			Data struct {
+				Title       string `json:"title"`
+				Author      string `json:"author"`
+				Score       int    `json:"score"`
+				Selftext    string `json:"selftext"`
+				Permalink   string `json:"permalink"`
+				CreatedUtc  int64  `json:"created_utc"`
+				NumComments int    `json:"num_comments"`
+			} `json:"data"`
+		} `json:"children"`
+	} `json:"data"`
+}
+
+var RedditThread = &ToolDef{
+	Name:        "reddit_thread",
+	Description: "Fetch a Reddit thread and its top comments. Provide the post URL or Reddit permalink.",
+	Args: []ToolArg{
+		{Name: "url", Description: "Reddit post URL or permalink (e.g. https://www.reddit.com/r/programming/comments/abc123/title/)", Required: true},
+		{Name: "sort", Description: "Sort comments by: 'top' (default), 'new', 'best', 'controversial'", Required: false},
+		{Name: "limit", Description: "Number of top-level comments (default 5, max 15)", Required: false},
+	},
+	Execute: func(args map[string]string) string {
+		urlArg := strings.TrimSpace(args["url"])
+		if urlArg == "" {
+			return "Error: url is required"
+		}
+
+		// Clean URL: remove trailing slash, ensure .json
+		urlArg = strings.TrimRight(urlArg, "/")
+		if !strings.HasSuffix(urlArg, ".json") {
+			urlArg += ".json"
+		}
+
+		sort := "top"
+		if s := strings.TrimSpace(args["sort"]); s != "" {
+			sort = strings.ToLower(s)
+		}
+
+		limit := 5
+		if l := strings.TrimSpace(args["limit"]); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 {
+				limit = n
+				if limit > 15 {
+					limit = 15
+				}
+			}
+		}
+
+		// Fetch thread JSON
+		fullURL := urlArg
+		if !strings.HasPrefix(fullURL, "http") {
+			fullURL = "https://www.reddit.com" + urlArg
+		}
+		fullURL = strings.ReplaceAll(fullURL, ".json.json", ".json")
+		fullURL += "?sort=" + sort
+
+		req, _ := http.NewRequest("GET", fullURL, nil)
+		req.Header.Set("User-Agent", "ApexClaw-Bot/1.0")
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Sprintf("Error fetching thread: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return fmt.Sprintf("Reddit API returned %d", resp.StatusCode)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+
+		// Parse 2-element array [post, comments_listing]
+		var threadArray []interface{}
+		if err := json.Unmarshal(body, &threadArray); err != nil {
+			return fmt.Sprintf("Error parsing thread: %v", err)
+		}
+
+		if len(threadArray) < 2 {
+			return "Error: invalid thread data"
+		}
+
+		// Extract post data
+		var postTitle, postAuthor string
+		var postScore, postCommentCount int
+		var postBody string
+
+		if postObj, ok := threadArray[0].(map[string]interface{}); ok {
+			if dataObj, ok := postObj["data"].(map[string]interface{}); ok {
+				if t, ok := dataObj["title"].(string); ok {
+					postTitle = t
+				}
+				if a, ok := dataObj["author"].(string); ok {
+					postAuthor = a
+				}
+				if s, ok := dataObj["score"].(float64); ok {
+					postScore = int(s)
+				}
+				if c, ok := dataObj["num_comments"].(float64); ok {
+					postCommentCount = int(c)
+				}
+				if b, ok := dataObj["selftext"].(string); ok {
+					postBody = b
+				}
+			}
+		}
+
+		// Extract comments
+		var comments []struct {
+			author string
+			score  int
+			body   string
+		}
+
+		if commentsObj, ok := threadArray[1].(map[string]interface{}); ok {
+			if dataObj, ok := commentsObj["data"].(map[string]interface{}); ok {
+				if children, ok := dataObj["children"].([]interface{}); ok {
+					for _, child := range children {
+						if childObj, ok := child.(map[string]interface{}); ok {
+							if dataChild, ok := childObj["data"].(map[string]interface{}); ok {
+								if author, ok := dataChild["author"].(string); ok {
+									if score, ok := dataChild["score"].(float64); ok {
+										if body, ok := dataChild["body"].(string); ok {
+											if body != "[deleted]" && body != "[removed]" && author != "[deleted]" {
+												comments = append(comments, struct {
+													author string
+													score  int
+													body   string
+												}{author, int(score), body})
+											}
+										}
+									}
+								}
+							}
+						}
+						if len(comments) >= limit {
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// Format output
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Thread: %s\n", postTitle))
+		sb.WriteString(fmt.Sprintf("by u/%s | %d upvotes | %d comments\n\n", postAuthor, postScore, postCommentCount))
+
+		if postBody != "" {
+			snippet := strings.TrimSpace(postBody)
+			if len(snippet) > 300 {
+				snippet = snippet[:300] + "…"
+			}
+			sb.WriteString(fmt.Sprintf("Post: %s\n\n", snippet))
+		}
+
+		sb.WriteString(fmt.Sprintf("Top %d Comments (%s):\n\n", len(comments), sort))
+		for i, c := range comments {
+			body := c.body
+			if len(body) > 200 {
+				body = body[:200] + "…"
+			}
+			body = strings.ReplaceAll(body, "\n", " ")
+			sb.WriteString(fmt.Sprintf("%d. u/%s (%d↑)\n   %s\n\n", i+1, c.author, c.score, body))
+		}
+
+		return strings.TrimRight(sb.String(), "\n")
+	},
+}

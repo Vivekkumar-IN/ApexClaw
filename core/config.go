@@ -56,17 +56,19 @@ var Cfg = Config{
 }
 
 func init() {
+	InitLogger()
+
 	if err := godotenv.Load(); err == nil {
-		log.Printf("[ENV] loaded .env")
+		Log.Infof("loaded .env")
 	} else {
-		log.Printf("[ENV] .env file not found")
+		Log.Infof(".env file not found")
 	}
 
 	if err := setup.InteractiveSetup(); err != nil {
-		log.Printf("[SETUP] %v", err)
+		Log.Warnf("%v", err)
 	}
 	if err := godotenv.Load(); err != nil {
-		log.Printf("[ENV] Error reloading .env: %v", err)
+		Log.Warnf("Error reloading .env: %v", err)
 	}
 
 	apiIdStr := os.Getenv("TELEGRAM_API_ID")
@@ -107,7 +109,7 @@ func init() {
 		}
 		envMap["WEB_JWT_SECRET"] = Cfg.WebJWTSecret
 		godotenv.Write(envMap, ".env")
-		log.Printf("[AUTH] Generated new JWT secret")
+		Log.Infof("Generated new JWT secret")
 	}
 
 	Cfg.WebFirstLogin = true

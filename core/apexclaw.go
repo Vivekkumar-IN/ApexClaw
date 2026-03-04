@@ -180,6 +180,14 @@ func buildSystemPrompt(reg *ToolRegistry, isWeb bool) string {
 
 const maxHistoryMessages = 60
 
+type TraceEntry struct {
+	Tool     string
+	Args     string
+	Result   string
+	Duration time.Duration
+	Error    bool
+}
+
 type AgentSession struct {
 	mu             sync.Mutex
 	client         *model.Client
@@ -191,6 +199,8 @@ type AgentSession struct {
 	deepWorkPlan   string
 	dynamicMaxIter int
 	streamCallback func(string)
+	debugMode      bool
+	traceLog       []TraceEntry
 }
 
 func (s *AgentSession) trimHistory() {
@@ -633,6 +643,51 @@ func (s *AgentSession) HistoryLen() int {
 	return len(s.history)
 }
 
+func (s *AgentSession) SetDebugMode(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.debugMode = enabled
+}
+
+func (s *AgentSession) ClearTrace() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.traceLog = []TraceEntry{}
+}
+
+func (s *AgentSession) DumpTrace() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.traceLog) == 0 {
+		return "Trace log is empty."
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[Trace Log — %d entries]\n\n", len(s.traceLog))
+
+	for i, entry := range s.traceLog {
+		status := "OK"
+		if entry.Error {
+			status = "ERROR"
+		}
+		sb.WriteString(fmt.Sprintf("%d. %s (%v) %s\n", i+1, entry.Tool, entry.Duration, status))
+		if entry.Args != "" && entry.Args != "{}" {
+			sb.WriteString(fmt.Sprintf("   Args: %s\n", entry.Args))
+		}
+		if entry.Result != "" {
+			result := entry.Result
+			if len(result) > 150 {
+				result = result[:150] + "..."
+			}
+			fmt.Fprintf(&sb, "   Result: %s\n", result)
+		}
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
+}
+
 func (s *AgentSession) executeTool(name, argsJSON, senderID string) string {
 	t, ok := s.registry.Get(name)
 	if !ok {
@@ -643,7 +698,7 @@ func (s *AgentSession) executeTool(name, argsJSON, senderID string) string {
 		realUserID = senderID[:idx]
 	}
 	if t.Secure && realUserID != Cfg.OwnerID && realUserID != "web_"+Cfg.OwnerID {
-		log.Printf("[AGENT] access denied: user %q tried secure tool %q", realUserID, name)
+		Log.Debugf("access denied: user %q tried secure tool %q", realUserID, name)
 		return fmt.Sprintf("Access denied: tool %q is restricted to the bot owner.", name)
 	}
 	var args map[string]string
@@ -652,14 +707,38 @@ func (s *AgentSession) executeTool(name, argsJSON, senderID string) string {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[AGENT] tool %s panic: %v", name, r)
+			Log.Warnf("tool %s panic: %v", name, r)
 		}
 	}()
 
+	start := time.Now()
+	var result string
 	if t.ExecuteWithContext != nil {
-		return t.ExecuteWithContext(args, senderID)
+		result = t.ExecuteWithContext(args, senderID)
+	} else {
+		result = t.Execute(args)
 	}
-	return t.Execute(args)
+	duration := time.Since(start)
+
+	// Record trace if debug mode enabled
+	if s.debugMode {
+		resultSnippet := result
+		if len(resultSnippet) > 200 {
+			resultSnippet = resultSnippet[:200] + "..."
+		}
+		entry := TraceEntry{
+			Tool:     name,
+			Args:     argsJSON,
+			Result:   resultSnippet,
+			Duration: duration,
+			Error:    isToolError(result),
+		}
+		s.mu.Lock()
+		s.traceLog = append(s.traceLog, entry)
+		s.mu.Unlock()
+	}
+
+	return result
 }
 
 func isToolError(result string) bool {
