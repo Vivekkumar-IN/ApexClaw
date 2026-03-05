@@ -206,7 +206,7 @@ func fireHeartbeatTask(t ScheduledTask) {
 		ownerID = Cfg.OwnerID
 	}
 
-	session := NewAgentSession(GlobalRegistry, Cfg.DefaultModel, false)
+	session := NewAgentSession(GlobalRegistry, Cfg.DefaultModel, "telegram")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()

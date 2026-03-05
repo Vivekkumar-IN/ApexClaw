@@ -73,7 +73,7 @@ func (r *ToolRegistry) Names() []string {
 	return names
 }
 
-func buildSystemPrompt(reg *ToolRegistry, isWeb bool) string {
+func buildSystemPrompt(reg *ToolRegistry, platform string) string {
 	var sb strings.Builder
 
 	sb.WriteString(
@@ -125,13 +125,29 @@ func buildSystemPrompt(reg *ToolRegistry, isWeb bool) string {
 			"Exception: fix-and-retry during error recovery does not need confirmation.\n\n",
 	)
 
-	if isWeb {
+	switch platform {
+	case "web":
 		sb.WriteString(
 			"## Formatting (Web UI)\n" +
 				"Standard Markdown. Use language-tagged code blocks. No Telegram HTML.\n" +
 				"Output full files/scripts without truncation. Use headers and lists for structure.\n\n",
 		)
-	} else {
+	case "whatsapp":
+		sb.WriteString(
+			"## Formatting (WhatsApp)\n" +
+				"WhatsApp Markdown ONLY. No HTML. No backticks (`) for inline code.\n" +
+				"Rules:\n" +
+				"- *bold* for emphasis.\n" +
+				"- _italic_ for styling.\n" +
+				"- ~text~ for strikethrough.\n" +
+				"- ```monospace``` for code blocks (no language tag).\n" +
+				"CRITICAL: DO NOT use markdown tables. WhatsApp does not support them. Use plain text or lists.\n" +
+				"Be extremely concise. WhatsApp messages should be short and direct.\n\n" +
+
+				"## WhatsApp Context\n" +
+				"Each message has a [WA Context] header. Use sender_id and chat_id for context.\n\n",
+		)
+	default:
 		sb.WriteString(
 			"## Formatting (Telegram)\n" +
 				"HTML ONLY. No markdown syntax (no *, **, _, #, `, >, [, ]).\n" +
@@ -196,7 +212,7 @@ type AgentSession struct {
 	history        []model.Message
 	registry       *ToolRegistry
 	model          string
-	isWeb          bool
+	platform       string
 	deepWorkActive bool
 	deepWorkPlan   string
 	dynamicMaxIter int
@@ -227,8 +243,8 @@ func (s *AgentSession) SetDeepWork(maxSteps int, plan string) {
 	s.dynamicMaxIter = maxSteps
 }
 
-func NewAgentSession(registry *ToolRegistry, mdl string, isWeb bool) *AgentSession {
-	sysPrompt := buildSystemPrompt(registry, isWeb)
+func NewAgentSession(registry *ToolRegistry, mdl string, platform string) *AgentSession {
+	sysPrompt := buildSystemPrompt(registry, platform)
 	var client *model.Client
 	if Cfg.DNS != "" {
 		client = model.NewWithCustomDialer(GetCustomDialer())
@@ -239,7 +255,7 @@ func NewAgentSession(registry *ToolRegistry, mdl string, isWeb bool) *AgentSessi
 		client:   client,
 		registry: registry,
 		model:    mdl,
-		isWeb:    isWeb,
+		platform: platform,
 		history:  []model.Message{{Role: "system", Content: sysPrompt}},
 	}
 }
@@ -635,7 +651,7 @@ func (s *AgentSession) RunStreamWithFiles(ctx context.Context, senderID, userTex
 func (s *AgentSession) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.history = []model.Message{{Role: "system", Content: buildSystemPrompt(s.registry, s.isWeb)}}
+	s.history = []model.Message{{Role: "system", Content: buildSystemPrompt(s.registry, s.platform)}}
 	log.Printf("[AGENT] session reset")
 }
 
@@ -857,9 +873,14 @@ func GetOrCreateAgentSession(key string) *AgentSession {
 	if ok {
 		return s
 	}
-	isWeb := strings.HasPrefix(key, "web_")
-	s = NewAgentSession(GlobalRegistry, Cfg.DefaultModel, isWeb)
-	if isWeb {
+	platform := "telegram"
+	if strings.HasPrefix(key, "web_") {
+		platform = "web"
+	} else if strings.HasPrefix(key, "wa_") {
+		platform = "whatsapp"
+	}
+	s = NewAgentSession(GlobalRegistry, Cfg.DefaultModel, platform)
+	if platform == "web" {
 		sessionID := strings.TrimPrefix(key, "web_")
 		if hist := LoadSession(sessionID); len(hist) > 0 {
 			s.mu.Lock()

@@ -116,9 +116,9 @@ func (b *WhatsAppBot) handleText(chatID types.JID, userID string, text string) {
 	b.client.SendPresence(context.Background(), types.PresenceAvailable)
 	b.client.SendChatPresence(context.Background(), chatID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 
-	session := GetOrCreateAgentSession(userID)
-	onChunk, flush, done := b.newStreamHandler(chatID, userID)
-	result, err := session.RunStream(timeoutCtx, userID, text, onChunk)
+	session := GetOrCreateAgentSession("wa_" + userID)
+	onChunk, flush, done := b.newStreamHandler(chatID, "wa_"+userID)
+	result, err := session.RunStream(timeoutCtx, "wa_"+userID, text, onChunk)
 
 	b.client.SendChatPresence(context.Background(), chatID, types.ChatPresencePaused, types.ChatPresenceMediaText)
 

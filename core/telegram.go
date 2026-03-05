@@ -64,7 +64,11 @@ func formatTGContext(ctx map[string]any) string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("[TG Context:")
+	header := "TG Context"
+	if v, ok := ctx["platform"]; ok && v == "whatsapp" {
+		header = "WA Context"
+	}
+	sb.WriteString("[" + header + ":")
 	if v, ok := ctx["sender_id"]; ok {
 		fmt.Fprintf(&sb, " sender_id=%v", v)
 	}
