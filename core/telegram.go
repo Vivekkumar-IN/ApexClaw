@@ -344,7 +344,24 @@ func (b *TelegramBot) handleText(m *telegram.NewMessage, text string) error {
 	}
 
 	if !m.IsPrivate() {
-		mentioned := strings.Contains(strings.ToLower(text), "apex")
+
+                textLower := strings.ToLower(text)
+                triggers := []string{
+                    "apex",
+                    "sofi",
+                    m.Client.Me().Username,
+                }
+
+                mentioned := false
+
+                for _, t := range triggers {
+                    if strings.Contains(textLower, t) {
+                        mentioned = true
+                        break
+                    }
+                }
+
+
 		if !mentioned && m.IsReply() {
 			if r, err := m.GetReplyMessage(); err == nil && r.SenderID() == b.client.Me().ID {
 				mentioned = true
