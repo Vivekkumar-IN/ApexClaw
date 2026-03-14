@@ -42,7 +42,7 @@ func main() {
 	if core.Cfg.WAOwnerID == "" {
 		log.Printf("[WA] WhatsApp not configured (optional) - set WA_OWNER_ID in .env to enable")
 	} else {
-		waBot, err := core.NewWhatsAppBot()
+		waBot, err := core.InitWhatsAppBot()
 		if err != nil {
 			log.Printf("[WA] bot init failed: %v", err)
 		} else {

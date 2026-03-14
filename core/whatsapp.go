@@ -29,6 +29,15 @@ var waBot *WhatsAppBot
 
 func GetWhatsAppBot() *WhatsAppBot { return waBot }
 
+func InitWhatsAppBot() (*WhatsAppBot, error) {
+	b, err := NewWhatsAppBot()
+	if err != nil {
+		return nil, err
+	}
+	waBot = b
+	return b, nil
+}
+
 func NewWhatsAppBot() (*WhatsAppBot, error) {
 	ctx := context.Background()
 
