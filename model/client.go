@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -108,6 +109,20 @@ func (c *Client) sendWithRetry(ctx context.Context, model string, messages []Mes
 }
 
 func (c *Client) sendInternal(ctx context.Context, model string, messages []Message, files []*UpstreamFile) (string, error) {
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("AI_PROVIDER")))
+	if provider == "" || provider == "zai" || provider == "glm" {
+		return c.sendInternalZAI(ctx, model, messages, files)
+	}
+
+	switch provider {
+	case "nvidia":
+		return c.sendInternalOpenAICompat(ctx, model, messages, files)
+	default:
+		return "", fmt.Errorf("unsupported AI_PROVIDER: %s", provider)
+	}
+}
+
+func (c *Client) sendInternalZAI(ctx context.Context, model string, messages []Message, files []*UpstreamFile) (string, error) {
 	token, err := GetAnonymousToken()
 	if err != nil {
 		return "", fmt.Errorf("auth: %w", err)
@@ -123,6 +138,214 @@ func (c *Client) sendInternal(ctx context.Context, model string, messages []Mess
 	}
 	_ = targetModel
 	return collectNonStream(resp.Body)
+}
+
+func (c *Client) sendInternalOpenAICompat(ctx context.Context, model string, messages []Message, files []*UpstreamFile) (string, error) {
+	apiKey := strings.TrimSpace(os.Getenv("NVIDIA_API_KEY"))
+	if apiKey == "" {
+		return "", fmt.Errorf("missing NVIDIA_API_KEY")
+	}
+
+	url := strings.TrimSpace(os.Getenv("NVIDIA_API_URL"))
+	if url == "" {
+		url = "https://integrate.api.nvidia.com/v1/chat/completions"
+	}
+
+	if model == "" {
+		model = "qwen/qwq-32b"
+	}
+
+	stream := envBool("NVIDIA_STREAM", true)
+	imageURLs := collectImageURLs(messages, files)
+
+	body := map[string]any{
+		"model":             model,
+		"messages":          toOpenAIMessages(messages, imageURLs),
+		"temperature":       envFloat("NVIDIA_TEMPERATURE", 0.6),
+		"top_p":             envFloat("NVIDIA_TOP_P", 0.95),
+		"frequency_penalty": 0,
+		"presence_penalty":  0,
+		"max_tokens":        envInt("NVIDIA_MAX_TOKENS", 16384),
+		"stream":            stream,
+		"chat_template_kwargs": map[string]any{
+			"enable_thinking": envBool("NVIDIA_ENABLE_THINKING", true),
+		},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1000))
+		return "", fmt.Errorf("upstream %d: %s", resp.StatusCode, string(body))
+	}
+
+	if stream {
+		return collectOpenAIStream(resp.Body)
+	}
+	return collectOpenAINonStream(resp.Body)
+}
+
+func toOpenAIMessages(messages []Message, imageURLs []string) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	lastUserIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			lastUserIdx = i
+			break
+		}
+	}
+
+	for i, m := range messages {
+		role := strings.TrimSpace(m.Role)
+		if role == "" {
+			continue
+		}
+
+		entry := map[string]any{"role": role}
+		if strings.EqualFold(role, "user") && len(imageURLs) > 0 && i == lastUserIdx {
+			parts := make([]map[string]any, 0, 1+len(imageURLs))
+			if strings.TrimSpace(m.Content) != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+			}
+			for _, img := range imageURLs {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": img},
+				})
+			}
+			entry["content"] = parts
+		} else {
+			entry["content"] = m.Content
+		}
+
+		out = append(out, entry)
+	}
+
+	if len(out) == 0 && len(imageURLs) > 0 {
+		parts := make([]map[string]any, 0, len(imageURLs)+1)
+		parts = append(parts, map[string]any{"type": "text", "text": "Describe this image"})
+		for _, img := range imageURLs {
+			parts = append(parts, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": img},
+			})
+		}
+		out = append(out, map[string]any{"role": "user", "content": parts})
+	} else if len(out) == 0 {
+		out = append(out, map[string]any{"role": "user", "content": "hi"})
+	}
+	return out
+}
+
+func collectImageURLs(messages []Message, files []*UpstreamFile) []string {
+	urls := make([]string, 0, len(files)+1)
+	seen := map[string]bool{}
+
+	addURL := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if !(strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") || strings.HasPrefix(v, "data:image/")) {
+			return
+		}
+		if seen[v] {
+			return
+		}
+		seen[v] = true
+		urls = append(urls, v)
+	}
+
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		if f.Media != "" && !strings.Contains(strings.ToLower(f.Media), "image") {
+			continue
+		}
+		addURL(f.URL)
+		if len(f.File) > 0 {
+			var raw map[string]any
+			if err := json.Unmarshal(f.File, &raw); err == nil {
+				if v, ok := raw["url"].(string); ok {
+					addURL(v)
+				}
+				if v, ok := raw["download_url"].(string); ok {
+					addURL(v)
+				}
+				if v, ok := raw["public_url"].(string); ok {
+					addURL(v)
+				}
+			}
+		}
+	}
+
+	for _, m := range messages {
+		for _, f := range m.Files {
+			if f.Media != "" && !strings.Contains(strings.ToLower(f.Media), "image") {
+				continue
+			}
+			addURL(f.URL)
+		}
+	}
+
+	return urls
+}
+
+func envBool(name string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func envInt(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	var n int
+	if _, err := fmt.Sscanf(v, "%d", &n); err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func envFloat(name string, fallback float64) float64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	var n float64
+	if _, err := fmt.Sscanf(v, "%f", &n); err != nil {
+		return fallback
+	}
+	return n
 }
 
 func makeUpstreamRequest(ctx context.Context, client *http.Client, token string, messages []Message, model string, files []*UpstreamFile) (*http.Response, string, error) {
@@ -251,8 +474,13 @@ type upstreamData struct {
 	Data struct {
 		DeltaContent string `json:"delta_content"`
 		EditContent  string `json:"edit_content"`
+		Content      string `json:"content"`
 		Phase        string `json:"phase"`
 		Done         bool   `json:"done"`
+		Error        *struct {
+			Code   string `json:"code"`
+			Detail string `json:"detail"`
+		} `json:"error"`
 	} `json:"data"`
 }
 
@@ -288,6 +516,23 @@ func collectNonStream(body io.Reader) (string, error) {
 		}
 		var u upstreamData
 		if err := json.Unmarshal([]byte(payload), &u); err != nil {
+			continue
+		}
+		if u.Data.Error != nil {
+			if u.Data.Error.Code != "" && u.Data.Error.Detail != "" {
+				return "", fmt.Errorf("model %s: %s", u.Data.Error.Code, u.Data.Error.Detail)
+			}
+			if u.Data.Error.Detail != "" {
+				return "", fmt.Errorf("model error: %s", u.Data.Error.Detail)
+			}
+			if u.Data.Error.Code != "" {
+				return "", fmt.Errorf("model error: %s", u.Data.Error.Code)
+			}
+			return "", fmt.Errorf("model error in stream response")
+		}
+
+		if u.Data.Phase == "" && u.Data.Content != "" {
+			chunks = append(chunks, u.Data.Content)
 			continue
 		}
 
@@ -340,6 +585,124 @@ func collectNonStream(body io.Reader) (string, error) {
 	result := strings.TrimSpace(strings.Join(chunks, ""))
 	if result == "" {
 		return "", fmt.Errorf("empty response from model")
+	}
+	return result, nil
+}
+
+func collectOpenAIStream(body io.Reader) (string, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 1024*1024), 4*1024*1024)
+
+	var chunks []string
+
+	type openAIResponse struct {
+		Error *struct {
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			break
+		}
+
+		var chunk openAIResponse
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Error != nil {
+			if chunk.Error.Code != "" && chunk.Error.Message != "" {
+				return "", fmt.Errorf("provider %s: %s", chunk.Error.Code, chunk.Error.Message)
+			}
+			if chunk.Error.Type != "" && chunk.Error.Message != "" {
+				return "", fmt.Errorf("provider %s: %s", chunk.Error.Type, chunk.Error.Message)
+			}
+			if chunk.Error.Message != "" {
+				return "", fmt.Errorf("provider error: %s", chunk.Error.Message)
+			}
+			return "", fmt.Errorf("provider error in stream response")
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if c := chunk.Choices[0].Delta.Content; c != "" {
+			chunks = append(chunks, c)
+			continue
+		}
+		if c := chunk.Choices[0].Message.Content; c != "" {
+			chunks = append(chunks, c)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("openai stream scanner: %w", err)
+	}
+
+	result := strings.TrimSpace(strings.Join(chunks, ""))
+	if result == "" {
+		return "", fmt.Errorf("empty response from provider")
+	}
+	return result, nil
+}
+
+func collectOpenAINonStream(body io.Reader) (string, error) {
+	type openAIResponse struct {
+		Error *struct {
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	var resp openAIResponse
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return "", fmt.Errorf("decode provider response: %w", err)
+	}
+	if resp.Error != nil {
+		if resp.Error.Code != "" && resp.Error.Message != "" {
+			return "", fmt.Errorf("provider %s: %s", resp.Error.Code, resp.Error.Message)
+		}
+		if resp.Error.Type != "" && resp.Error.Message != "" {
+			return "", fmt.Errorf("provider %s: %s", resp.Error.Type, resp.Error.Message)
+		}
+		if resp.Error.Message != "" {
+			return "", fmt.Errorf("provider error: %s", resp.Error.Message)
+		}
+		return "", fmt.Errorf("provider error")
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("empty response from provider")
+	}
+	result := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if result == "" {
+		return "", fmt.Errorf("empty response from provider")
 	}
 	return result, nil
 }
